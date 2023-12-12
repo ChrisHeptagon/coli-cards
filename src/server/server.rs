@@ -1,30 +1,18 @@
-use argon2::{
-  password_hash::{rand_core::OsRng, PasswordHasher, SaltString},
-  Argon2,
-};
 use axum::{
   body::Body,
-  extract::{ws::WebSocket, Request, WebSocketUpgrade},
-  http::uri::Scheme,
+  extract::Request,
   response::{IntoResponse, Response},
   routing::get,
   Router,
 };
 use futures::{SinkExt, StreamExt};
-use http_body_util::BodyStream;
 use hyper::client::conn::http1::Builder;
-use hyper::header::CONTENT_TYPE;
 use hyper_tungstenite::HyperWebsocket;
 use hyper_util::rt::TokioIo;
-use multer::Multipart;
 use std::env;
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::connect_async;
-
-use crate::models::models::{
-  gen_admin_schema, gen_admin_table, insert_form_data, query_admin_table, Field, HTMLFieldType,
-};
 
 pub async fn main_server() {
   let addr = "0.0.0.0:3006";
@@ -34,226 +22,6 @@ pub async fn main_server() {
     .route("/*wildcard", get(frontend_ssr_handler));
   println!("Listening on http://{}", addr);
   axum::serve(listener, app).await.unwrap();
-}
-
-async fn handle_user_login(req: &mut Request<Body>) -> Response {
-  let boundary = req
-    .headers()
-    .get(CONTENT_TYPE)
-    .and_then(|ct| ct.to_str().ok())
-    .and_then(|ct| multer::parse_boundary(ct).ok());
-
-  if boundary.is_none() {
-    return Response::builder()
-      .status(hyper::StatusCode::BAD_REQUEST)
-      .body(Body::from("Invalid boundary"))
-      .expect("Failed to build response");
-  };
-
-  let body_stream = BodyStream::new(req.body_mut())
-    .filter_map(|result| async move { result.map(|frame| frame.into_data().ok()).transpose() });
-
-  let mut multipart = Multipart::new(body_stream, boundary.expect("Failed to get boundary"));
-  let schema: String = gen_admin_schema().await;
-  let parsed_schema: HashMap<String, Field> =
-    serde_json::from_str(&schema).expect("Failed to parse schema");
-  let mut err_vec: Vec<String> = Vec::new();
-  let mut form_data: HashMap<String, String> = HashMap::new();
-
-  while let Some(field) = multipart
-    .next_field()
-    .await
-    .expect("Failed to get next field")
-  {
-    let name = field.name().expect("Failed to get field name").to_string();
-    match parsed_schema.get(&name.to_string()) {
-      Some(schema_field) => match schema_field.required {
-        true => {
-          let value = field
-            .text()
-            .await
-            .expect("Failed to get field value")
-            .to_string();
-          match value.is_empty() {
-            true => {
-              err_vec.push(format!("{} is required", name));
-            }
-            false => {
-              let field_regex =
-                regex::Regex::new(&schema_field.pattern).expect("Failed to parse field regex");
-              match field_regex.is_match(&value) {
-                true => match schema_field.form_type {
-                  HTMLFieldType::Text => {
-                    form_data.insert(name, value);
-                  }
-                  HTMLFieldType::Email => {
-                    form_data.insert(name, value);
-                  }
-                  HTMLFieldType::Password => {
-                    let password = &value.into_bytes();
-                    let salt = SaltString::generate(&mut OsRng);
-                    let argon2 = Argon2::default();
-                    let hash = argon2
-                      .hash_password(password, &salt)
-                      .expect("Failed to hash password")
-                      .to_string();
-                    println!("Hash: {}", hash);
-                    form_data.insert(name, hash);
-                  }
-                },
-                false => {
-                  err_vec.push(format!("{} is not valid", name));
-                }
-              }
-            }
-          }
-        }
-        false => {
-          continue;
-        }
-      },
-      None => {
-        err_vec.push(format!("{} is not a valid field", name));
-      }
-    }
-  }
-  if !err_vec.is_empty() {
-    return Response::builder()
-      .status(hyper::StatusCode::BAD_REQUEST)
-      .body(Body::from(err_vec.join("\n")))
-      .expect("Failed to build response");
-  };
-
-  if !form_data.is_empty() {
-    println!("Form data: {:?}", form_data);
-    query_admin_table(form_data).await;
-  }
-
-  Response::builder()
-    .status(200)
-    .body(Body::from("Hello, World!"))
-    .expect("Failed to build response")
-}
-
-async fn handle_invalid_path() -> Response {
-  Response::builder()
-    .status(hyper::StatusCode::NOT_FOUND)
-    .body(Body::from("Invalid path"))
-    .expect("Failed to build response")
-}
-
-async fn handle_invalid_method() -> Response {
-  Response::builder()
-    .status(hyper::StatusCode::METHOD_NOT_ALLOWED)
-    .body(Body::from("Invalid method"))
-    .expect("Failed to build response")
-}
-
-async fn login_schema() -> Response {
-  let schema = gen_admin_schema().await;
-  Response::builder()
-    .status(200)
-    .body(Body::new(schema))
-    .expect("Failed to build response")
-}
-
-async fn handle_user_init(req: &mut Request) -> Response {
-  let boundary = req
-    .headers()
-    .get(CONTENT_TYPE)
-    .and_then(|ct| ct.to_str().ok())
-    .and_then(|ct| multer::parse_boundary(ct).ok());
-
-  if boundary.is_none() {
-    return Response::builder()
-      .status(hyper::StatusCode::BAD_REQUEST)
-      .body(Body::from("Invalid boundary"))
-      .expect("Failed to build response");
-  }
-
-  let body_stream = BodyStream::new(req.body_mut())
-    .filter_map(|result| async move { result.map(|frame| frame.into_data().ok()).transpose() });
-
-  let mut multipart = Multipart::new(body_stream, boundary.expect("Failed to get boundary"));
-  let schema: String = gen_admin_schema().await;
-  let parsed_schema: HashMap<String, Field> =
-    serde_json::from_str(&schema).expect("Failed to parse schema");
-  let mut err_vec: Vec<String> = Vec::new();
-  let mut form_data: HashMap<String, String> = HashMap::new();
-
-  while let Some(field) = multipart
-    .next_field()
-    .await
-    .expect("Failed to get next field")
-  {
-    let name = field.name().expect("Failed to get field name").to_string();
-    match parsed_schema.get(&name.to_string()) {
-      Some(schema_field) => match schema_field.required {
-        true => {
-          let value = field
-            .text()
-            .await
-            .expect("Failed to get field value")
-            .to_string();
-          match value.is_empty() {
-            true => {
-              err_vec.push(format!("{} is required", name));
-            }
-            false => {
-              let field_regex =
-                regex::Regex::new(&schema_field.pattern).expect("Failed to parse field regex");
-              match field_regex.is_match(&value) {
-                true => match schema_field.form_type {
-                  HTMLFieldType::Text => {
-                    form_data.insert(name, value);
-                  }
-                  HTMLFieldType::Email => {
-                    form_data.insert(name, value);
-                  }
-                  HTMLFieldType::Password => {
-                    let password = &value.into_bytes();
-                    let salt = SaltString::generate(&mut OsRng);
-                    let argon2 = Argon2::default();
-                    let hash = argon2
-                      .hash_password(password, &salt)
-                      .expect("Failed to hash password")
-                      .to_string();
-                    println!("Hash: {}", hash);
-                    form_data.insert(name, hash);
-                  }
-                },
-                false => {
-                  err_vec.push(format!("{} is not valid", name));
-                }
-              }
-            }
-          }
-        }
-        false => {
-          continue;
-        }
-      },
-      None => {
-        err_vec.push(format!("{} is not a valid field", name));
-      }
-    }
-  }
-  if !err_vec.is_empty() {
-    return Response::builder()
-      .status(hyper::StatusCode::BAD_REQUEST)
-      .body(Body::from(err_vec.join("\n")))
-      .expect("Failed to build response");
-  }
-
-  if !form_data.is_empty() {
-    println!("Form data: {:?}", form_data);
-  }
-  gen_admin_table().await;
-  insert_form_data(form_data).await;
-  Response::builder()
-    .status(200)
-    .body(Body::from("Hello, World!"))
-    .expect("Failed to build response")
 }
 
 async fn frontend_ssr_handler(request: Request<Body>) -> impl IntoResponse {
@@ -277,7 +45,6 @@ async fn frontend_ssr_handler(request: Request<Body>) -> impl IntoResponse {
 
 async fn proxy_handler(mut main_req: Request<Body>, port: u16) -> impl IntoResponse {
   let dev_server_url = format!("http://localhost:{}{}", port, main_req.uri().path());
-  println!("Proxying to {}", dev_server_url);
   let url = url::Url::parse(&dev_server_url).expect("Failed to parse dev server url");
   let host = url.host_str().expect("uri has no host");
   let port = url.port().expect("uri has no port");
@@ -298,14 +65,11 @@ async fn proxy_handler(mut main_req: Request<Body>, port: u16) -> impl IntoRespo
     }
   });
 
-  if std::env::var("MODE").expect("Failed to get mode") == "DEV"
-    && main_req.uri().to_string() == "/_next/webpack-hmr"
-  {
-    println!("HMR request");
+  if std::env::var("MODE").expect("Failed to get mode") == "DEV" {
     if hyper_tungstenite::is_upgrade_request(&main_req) {
       if let Ok((response, websocket)) = hyper_tungstenite::upgrade(&mut main_req, None) {
         tokio::task::spawn(async move {
-          if let Err(err) = serve_proxy_ws(websocket).await {
+          if let Err(err) = serve_proxy_ws(websocket, main_req).await {
             println!("Error serving websocket: {:?}", err);
           }
         });
@@ -321,16 +85,17 @@ async fn proxy_handler(mut main_req: Request<Body>, port: u16) -> impl IntoRespo
 }
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-async fn serve_proxy_ws(ws: HyperWebsocket) -> Result<(), Error> {
-  let mut websocket = Arc::new(Mutex::new(ws.await.expect("Failed to get websocket")));
+async fn serve_proxy_ws(ws: HyperWebsocket, req: Request<Body>) -> Result<(), Error> {
+  let websocket = Arc::new(Mutex::new(ws.await.expect("Failed to get websocket")));
   let (wss, _) = connect_async(format!(
-    "ws://localhost:{}/_next/webpack-hmr",
-    env::var("DEV_PORT").expect("Failed to get dev server port")
+    "ws://localhost:{}{}",
+    env::var("DEV_PORT").expect("Failed to get dev server port"),
+    req.uri().path()
   ))
   .await
   .expect("Failed to connect");
 
-  let mut ws_stream = Arc::new(Mutex::new(wss));
+  let ws_stream = Arc::new(Mutex::new(wss));
 
   while let Some(msg) = {
     let mut websocket = websocket.lock().await;
