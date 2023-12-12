@@ -5,7 +5,7 @@ export default function Home() {
         <h1>Hello and Greetings</h1>
         <p>
           Welcome to the Coli-Cards website. The home of the Coli-Cards
-          Flashcard App.
+          Flashcard App. This app is designed to help you learn the
         </p>
       </section>
     </main>

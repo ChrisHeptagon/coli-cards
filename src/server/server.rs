@@ -4,27 +4,30 @@ use argon2::{
 };
 use axum::{
   body::Body,
-  extract::Request,
+  extract::{ws::WebSocket, Request, WebSocketUpgrade},
+  http::uri::Scheme,
   response::{IntoResponse, Response},
   routing::get,
   Router,
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use http_body_util::BodyStream;
 use hyper::client::conn::http1::Builder;
 use hyper::header::CONTENT_TYPE;
+use hyper_tungstenite::HyperWebsocket;
 use hyper_util::rt::TokioIo;
 use multer::Multipart;
-use std::collections::HashMap;
 use std::env;
-use tokio::net::TcpStream;
+use std::{collections::HashMap, sync::Arc};
+use tokio::{net::TcpStream, sync::Mutex};
+use tokio_tungstenite::connect_async;
 
 use crate::models::models::{
   gen_admin_schema, gen_admin_table, insert_form_data, query_admin_table, Field, HTMLFieldType,
 };
 
 pub async fn main_server() {
-  let addr = "0.0.0.0:3005";
+  let addr = "0.0.0.0:3006";
   let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
   let app = Router::new()
     .route("/", get(frontend_ssr_handler))
@@ -272,11 +275,10 @@ async fn frontend_ssr_handler(request: Request<Body>) -> impl IntoResponse {
   }
 }
 
-async fn proxy_handler(main_req: Request<Body>, port: u16) -> impl IntoResponse {
+async fn proxy_handler(mut main_req: Request<Body>, port: u16) -> impl IntoResponse {
   let dev_server_url = format!("http://localhost:{}{}", port, main_req.uri().path());
-  let url = dev_server_url
-    .parse::<url::Url>()
-    .expect("Failed to parse dev server url");
+  println!("Proxying to {}", dev_server_url);
+  let url = url::Url::parse(&dev_server_url).expect("Failed to parse dev server url");
   let host = url.host_str().expect("uri has no host");
   let port = url.port().expect("uri has no port");
 
@@ -295,12 +297,54 @@ async fn proxy_handler(main_req: Request<Body>, port: u16) -> impl IntoResponse 
       println!("Error serving connection: {:?}", err);
     }
   });
+
+  if std::env::var("MODE").expect("Failed to get mode") == "DEV"
+    && main_req.uri().to_string() == "/_next/webpack-hmr"
+  {
+    println!("HMR request");
+    if hyper_tungstenite::is_upgrade_request(&main_req) {
+      if let Ok((response, websocket)) = hyper_tungstenite::upgrade(&mut main_req, None) {
+        tokio::task::spawn(async move {
+          if let Err(err) = serve_proxy_ws(websocket).await {
+            println!("Error serving websocket: {:?}", err);
+          }
+        });
+        return response.into_response();
+      }
+    }
+  };
   let resp = sender
     .send_request(main_req)
     .await
     .expect("Failed to send request to dev server");
-
   resp.into_response()
+}
+
+type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
+async fn serve_proxy_ws(ws: HyperWebsocket) -> Result<(), Error> {
+  let mut websocket = Arc::new(Mutex::new(ws.await.expect("Failed to get websocket")));
+  let (wss, _) = connect_async(format!(
+    "ws://localhost:{}/_next/webpack-hmr",
+    env::var("DEV_PORT").expect("Failed to get dev server port")
+  ))
+  .await
+  .expect("Failed to connect");
+
+  let mut ws_stream = Arc::new(Mutex::new(wss));
+
+  while let Some(msg) = {
+    let mut websocket = websocket.lock().await;
+    websocket.next().await
+  } {
+    let mut websocket = websocket.lock().await;
+    let mut ws_stream = ws_stream.lock().await;
+    let msg = msg.expect("Failed to get message");
+    ws_stream.send(msg).await.expect("Failed to send message");
+    let msg = ws_stream.next().await.expect("Failed to get message");
+    websocket.send(msg?).await.expect("Failed to send message");
+  }
+
+  Ok(())
 }
 
 async fn no_mode_handler(_: Request<Body>) -> impl IntoResponse {
